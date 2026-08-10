@@ -63,6 +63,19 @@ function safeRedirect(target, req) {
   return fallback;
 }
 
+// IP réelle du client. Railway est derrière un proxy (trust proxy activé),
+// donc la vraie adresse est en tête de x-forwarded-for. Sert à l'anti-abus
+// (parrainage même-IP + limite souple d'inscriptions par IP).
+function clientIp(req) {
+  const xff = (req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return xff || req.ip || (req.socket && req.socket.remoteAddress) || '';
+}
+
+// Limite souple : nombre max d'inscriptions e-mail depuis une même IP sur 24 h.
+// Volontairement généreux (les familles/bureaux/4G partagent une IP) — c'est
+// un simple frein anti-création en masse, pas un blocage strict.
+const SIGNUPS_MAX_PER_IP_24H = 5;
+
 const router = express.Router();
 
 // --- Inscription e-mail (session immédiate, sans e-mail de confirmation) ---
@@ -72,9 +85,22 @@ router.post('/signup', async (req, res) => {
   const displayName = (req.body.data && req.body.data.display_name) || req.body.display_name || '';
   if (!email || !email.includes('@')) return res.status(400).json({ error: { message: 'e-mail invalide' } });
   if (password.length < 8) return res.status(400).json({ error: { message: 'mot de passe : 8 caractères minimum' } });
+  const ip = clientIp(req);
+  // Limite souple anti-création en masse : trop d'inscriptions récentes depuis cette IP.
+  if (ip) {
+    try {
+      const rl = await pool.query(
+        "select count(*)::int as n from public.profiles where signup_ip = $1 and created_at > now() - interval '24 hours'",
+        [ip]
+      );
+      if (rl.rows[0].n >= SIGNUPS_MAX_PER_IP_24H) {
+        return res.status(429).json({ error: { message: 'Trop d’inscriptions depuis ce réseau aujourd’hui. Réessaie demain ou depuis une autre connexion.' } });
+      }
+    } catch (_) { /* si le contrôle échoue, on n'empêche pas l'inscription */ }
+  }
   try {
     const hash = await bcrypt.hash(password, 10);
-    const meta = JSON.stringify({ display_name: displayName });
+    const meta = JSON.stringify({ display_name: displayName, signup_ip: ip });
     const r = await pool.query(
       `insert into auth.users(email, encrypted_password, raw_user_meta_data, email_confirmed_at)
        values ($1,$2,$3::jsonb, now()) returning id, email`,
@@ -189,7 +215,7 @@ router.get('/google/callback', async (req, res) => {
         u = (await pool.query(
           `insert into auth.users(email, google_sub, raw_user_meta_data, email_confirmed_at)
            values ($1,$2,$3::jsonb, now()) returning id, email`,
-          [email, info.sub, JSON.stringify({ display_name: name })]
+          [email, info.sub, JSON.stringify({ display_name: name, signup_ip: clientIp(req) })]
         )).rows[0];
       }
     }

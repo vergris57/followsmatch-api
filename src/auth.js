@@ -20,7 +20,8 @@ function sessionPayload(user) {
   return { access_token, token_type: 'bearer', user: { id: user.id, email: user.email } };
 }
 function verify(token) {
-  try { return jwt.verify(token, SECRET); } catch (_) { return null; }
+  // Algorithme verrouillé (HS256) : empêche les attaques par substitution d'algorithme.
+  try { return jwt.verify(token, SECRET, { algorithms: ['HS256'] }); } catch (_) { return null; }
 }
 
 // Middleware : renseigne req.userId si un Bearer valide est présent (sinon null, pas d'erreur).
@@ -41,6 +42,25 @@ function requireAuth(req, res, next) {
 function apiBase(req) {
   const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0];
   return process.env.PUBLIC_URL || `${proto}://${req.get('host')}`;
+}
+
+// Sécurité OAuth : n'autorise le retour (« redirect_to ») que vers les domaines de
+// confiance de FollowsMatch. Sans ce filtre, un pirate pourrait renvoyer la victime
+// vers son propre site AVEC le jeton de session dans l'URL (prise de contrôle du compte).
+const REDIRECT_ALLOW = [
+  'https://followsmatch.com',
+  'https://www.followsmatch.com',
+  'https://vergris57.github.io',
+];
+function safeRedirect(target, req) {
+  const fallback = 'https://followsmatch.com/';
+  try {
+    const allow = REDIRECT_ALLOW.slice();
+    try { allow.push(new URL(apiBase(req)).origin); } catch (_) {}
+    const u = new URL(String(target));
+    if (u.protocol === 'https:' && allow.includes(u.origin)) return u.toString();
+  } catch (_) {}
+  return fallback;
 }
 
 const router = express.Router();
@@ -114,7 +134,7 @@ router.post('/update-user', authOptional, requireAuth, async (req, res) => {
 router.get('/google/start', (req, res) => {
   const cid = process.env.GOOGLE_CLIENT_ID;
   if (!cid) return res.status(400).send('Google non configuré (GOOGLE_CLIENT_ID manquant).');
-  const redirectTo = req.query.redirect_to || apiBase(req);
+  const redirectTo = safeRedirect(req.query.redirect_to || apiBase(req), req);
   const state = Buffer.from(JSON.stringify({ r: redirectTo })).toString('base64url');
   const p = new URLSearchParams({
     client_id: cid,
@@ -135,6 +155,8 @@ router.get('/google/callback', async (req, res) => {
     const st = JSON.parse(Buffer.from(String(req.query.state || ''), 'base64url').toString());
     if (st && st.r) redirectTo = st.r;
   } catch (_) {}
+  // Neutralise tout retour hors des domaines FollowsMatch (le jeton ne fuit jamais dehors).
+  redirectTo = safeRedirect(redirectTo, req);
   try {
     if (!cid || !secret) throw new Error('Google non configuré (client id/secret).');
     const code = req.query.code;
@@ -151,6 +173,8 @@ router.get('/google/callback', async (req, res) => {
       headers: { authorization: 'Bearer ' + tok.access_token },
     }).then((r) => r.json());
     if (!info.sub || !info.email) throw new Error('profil Google illisible');
+    // Exige un e-mail Google confirmé : empêche de rattacher/créer un compte avec un e-mail non prouvé.
+    if (info.email_verified !== true && info.email_verified !== 'true') throw new Error('e-mail Google non vérifié');
 
     const email = info.email.toLowerCase();
     const name = info.name || info.given_name || '';

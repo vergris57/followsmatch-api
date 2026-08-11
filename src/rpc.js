@@ -20,6 +20,7 @@ const RPC = {
   fn_apply_referral:   { kind: 'void',   params: ['p_code'] },
   fn_leaderboard:      { kind: 'set',    params: ['p_limit'] },
   fn_set_username:     { kind: 'void',   params: ['p_account', 'p_username'] },
+  fn_admin_stats:      { kind: 'scalar', params: [] },
 };
 
 const router = express.Router();
